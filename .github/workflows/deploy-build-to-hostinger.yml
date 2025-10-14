@@ -1,37 +1,119 @@
-name: Build Vite and Deploy to Hostinger
+name: CI/CD — Build & Deploy to Hostinger via SSH
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_mysql, openssl, tokenizer, xml, curl
+
+      - name: Install Composer (if needed) and show version
+        run: |
+          composer --version || (php -r "copy('https://getcomposer.org/installer','composer-setup.php');" && php composer-setup.php && mv composer.phar composer && chmod +x composer)
+          composer --version
+
+      - name: Install PHP dependencies (CI runner)
+        run: composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader
+        env:
+          COMPOSER_MEMORY_LIMIT: -1
+
+      - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'
           cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install Node & Build assets
+        run: |
+          npm ci
+          npm run build
 
-      - name: Build Vite assets
-        run: npm run build
+      - name: Clean unneeded from runner before upload
+        run: |
+          rm -rf node_modules
+          rm -rf .github
 
-      - name: Deploy public/build to Hostinger
-        uses: SamKirkland/FTP-Deploy-Action@4.3.0
+      - name: Archive project for transfer
+        run: |
+          tar --exclude='.git' -czf release.tar.gz .
+
+      - name: Copy archive to server via scp
+        uses: appleboy/scp-action@v0.1.7
         with:
-          server: ${{ secrets.FTP_SERVER }}
-          username: ${{ secrets.FTP_USERNAME }}
-          password: ${{ secrets.FTP_PASSWORD }}
-          port: ${{ secrets.FTP_PORT }}
-          local-dir: public/build
-          server-dir: ${{ secrets.FTP_TARGET_BUILD_DIR }}
-          passive: true
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ''
+          source: "release.tar.gz"
+          target: "${{ secrets.TARGET_DIR }}"
+
+      - name: Remote: extract & install on server
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            TARGET="{{ secrets.TARGET_DIR }}"
+            PUBLIC="{{ secrets.PUBLIC_DIR }}"
+            cd "$TARGET"
+            # extract to tmp and move to release folder
+            tar -xzf release.tar.gz -C "$TARGET"
+            rm -f release.tar.gz
+
+            # ensure vendor exist, use composer on server if available; else try composer2.phar
+            if ! command -v composer >/dev/null 2>&1; then
+              if [ -f composer2.phar ]; then
+                PHP_COMPOSER="php composer2.phar"
+              else
+                echo "composer not found on server; please install or upload composer2.phar"
+                PHP_COMPOSER=""
+              fi
+            else
+              PHP_COMPOSER="composer"
+            fi
+
+            # Install php deps on server if composer available (recommended)
+            if [ -n "$PHP_COMPOSER" ]; then
+              echo "Installing composer dependencies on server..."
+              COMPOSER_MEMORY_LIMIT=-1 $PHP_COMPOSER install --no-dev --no-interaction --prefer-dist --optimize-autoloader
+            else
+              echo "Skipping composer install - ensure vendor/ uploaded from CI if needed."
+            fi
+
+            # Create storage link if missing
+            if [ -f artisan ]; then
+              php artisan storage:link || true
+              php artisan migrate --force || true
+              php artisan config:cache || true
+              php artisan route:cache || true
+              php artisan view:cache || true
+            fi
+
+            # Ensure permissions
+            chown -R $USER:$USER "$TARGET" || true
+            chmod -R 775 "$TARGET/storage" "$TARGET/bootstrap/cache" || true
+
+            # Copy public content to public_html (if you want to keep public outside)
+            # If you use public_html as webroot, sync public to PUBLIC dir:
+            if [ -n "$PUBLIC" ]; then
+              rsync -av --delete "$TARGET/public/" "$PUBLIC/"
+              chmod -R 755 "$PUBLIC"
+            fi
+
+            echo "Deploy finished."
+
